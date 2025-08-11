@@ -25,45 +25,64 @@ def get_sp500_metadata():
     return df[['Ticker', 'Security', 'Sector', 'Industry Group']]
 
 def _trading_days(start_date, end_date_exclusive):
-    if HAS_MCAL:
+    # Return tz-naive, normalized daily index
+    start_dt = pd.to_datetime(start_date)
+    end_exc_dt = pd.to_datetime(end_date_exclusive)
+
+    try:
+        import pandas_market_calendars as mcal
         nyse = mcal.get_calendar('NYSE')
-        sched = nyse.schedule(start_date=start_date, end_date=end_date_exclusive - pd.Timedelta(days=1))
-        return pd.DatetimeIndex(sched.index, name="Date")
-    # fallback to business days
-    return pd.bdate_range(start=start_date, end=end_date_exclusive - pd.Timedelta(days=1), name="Date")
+        sched = nyse.schedule(start_date=start_dt, end_date=end_exc_dt - pd.Timedelta(days=1))
+        idx = pd.DatetimeIndex(sched.index)
+    except Exception:
+        idx = pd.bdate_range(start=start_dt, end=end_exc_dt - pd.Timedelta(days=1))
+
+    # force tz-naive midnight dates
+    idx = pd.to_datetime(idx).tz_localize(None).normalize()
+    return idx
 
 @st.cache_data(ttl=2*60*60, show_spinner=False)
 def get_price_data_with_trading_days(tickers, start_date, end_date, min_data_fraction=0.95, sleep_sec=0.02):
-    # yfinance end is EXCLUSIVE → add +1 day
-    start_str = pd.to_datetime(start_date).strftime("%Y-%m-%d")
-    end_excl = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    # yfinance end is exclusive ⇒ add +1 day
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    end_excl = (end_dt + pd.Timedelta(days=1))
 
-    td = set(_trading_days(pd.to_datetime(start_str), pd.to_datetime(end_excl)))
-    if not td:
+    # Common trading-day index (tz-naive, normalized)
+    td_index = _trading_days(start_dt, end_excl)
+    if len(td_index) == 0:
         return pd.DataFrame()
 
-    adj_close = {}
+    out = {}
     for t in tickers:
-        d = yf.download(t, start=start_str, end=end_excl, auto_adjust=True, progress=False, threads=True)
+        d = yf.download(t, start=start_dt, end=end_excl, auto_adjust=True, progress=False, threads=True)
         if d.empty:
             continue
+
         # choose column
-        if 'Adj Close' in d.columns:
-            sub = d['Adj Close']
-        elif 'Close' in d.columns:
-            sub = d['Close']
-        else:
+        col = 'Adj Close' if 'Adj Close' in d.columns else ('Close' if 'Close' in d.columns else None)
+        if col is None:
             continue
-        overlap = td & set(sub.index)
-        if len(overlap) == 0:
-            continue
-        # require enough coverage (like your Jupyter version)
-        if len(overlap) / len(td) >= min_data_fraction:
-            adj_close[t] = sub.loc[sorted(overlap)]
+
+        sub = d[col].copy()
+        # Make Yahoo index tz-naive, normalized to dates
+        sub.index = pd.to_datetime(sub.index).tz_localize(None).normalize()
+
+        # Align to trading-day index; drop missing for coverage check
+        aligned = sub.reindex(td_index)
+        present = aligned.dropna()
+
+        if len(present) / len(td_index) >= min_data_fraction:
+            # Keep only the aligned series with the common index (NaNs kept to preserve index)
+            out[t] = aligned
         time.sleep(sleep_sec)
-    if not adj_close:
+
+    if not out:
         return pd.DataFrame()
-    return pd.DataFrame(adj_close)
+
+    # Build DataFrame with shared trading-day index
+    df = pd.DataFrame(out, index=td_index)
+    return df
 
 def calculate_sum_daily_return(prices):
     if prices.empty or prices.shape[0] < 2:
