@@ -1,21 +1,15 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import time
 from datetime import date, timedelta
+import time
 
-# Optional NYSE calendar (falls back to weekdays if not available)
-try:
-    import pandas_market_calendars as mcal
-    HAS_MCAL = True
-except Exception:
-    HAS_MCAL = False
-
+# -------------------- UI SETUP --------------------
 st.set_page_config(page_title="S&P 500 Outliers", layout="wide")
 st.title("📊 S&P 500 — Outliers, Sector & Industry Performance")
+st.caption("Prices: Yahoo Finance • Constituents: Wikipedia • Note: Yahoo end date is exclusive (+1 day).")
 
-# ---------------- Your working logic, preserved ----------------
-@st.cache_data(ttl=12*60*60)
+# -------------------- HELPERS (same logic as notebook, with robust guards) --------------------
 def get_sp500_metadata():
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     tables = pd.read_html(url)
@@ -25,10 +19,9 @@ def get_sp500_metadata():
     return df[['Ticker', 'Security', 'Sector', 'Industry Group']]
 
 def _trading_days(start_date, end_date_exclusive):
-    # Return tz-naive, normalized daily index
+    # tz-naive, normalized trading-day index; use NYSE if available, else business days
     start_dt = pd.to_datetime(start_date)
     end_exc_dt = pd.to_datetime(end_date_exclusive)
-
     try:
         import pandas_market_calendars as mcal
         nyse = mcal.get_calendar('NYSE')
@@ -36,55 +29,74 @@ def _trading_days(start_date, end_date_exclusive):
         idx = pd.DatetimeIndex(sched.index)
     except Exception:
         idx = pd.bdate_range(start=start_dt, end=end_exc_dt - pd.Timedelta(days=1))
-
-    # force tz-naive midnight dates
     idx = pd.to_datetime(idx).tz_localize(None).normalize()
     return idx
 
-@st.cache_data(ttl=2*60*60, show_spinner=False)
-def get_price_data_with_trading_days(tickers, start_date, end_date, min_data_fraction=0.95, sleep_sec=0.02):
-    # yfinance end is exclusive ⇒ add +1 day
+def get_price_data_with_trading_days(tickers, start_date, end_date, min_data_fraction=0.90, sleep_sec=0.0):
+    """
+    Per-ticker fetch (stable on cloud). Ensures each dict entry is a 1-D Series
+    aligned to a common trading-day index. Skips tickers with poor coverage.
+    """
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
-    end_excl = (end_dt + pd.Timedelta(days=1))
+    end_excl = end_dt + pd.Timedelta(days=1)  # yfinance 'end' is exclusive
 
-    # Common trading-day index (tz-naive, normalized)
     td_index = _trading_days(start_dt, end_excl)
     if len(td_index) == 0:
         return pd.DataFrame()
 
     out = {}
     for t in tickers:
-        d = yf.download(t, start=start_dt, end=end_excl, auto_adjust=True, progress=False, threads=True)
-        if d.empty:
+        d = yf.download(
+            t, start=start_dt, end=end_excl,
+            auto_adjust=True, progress=False,
+            threads=False, interval="1d", prepost=False
+        )
+        if d is None or d.empty:
             continue
 
-        # choose column
-        col = 'Adj Close' if 'Adj Close' in d.columns else ('Close' if 'Close' in d.columns else None)
-        if col is None:
-            continue
+        # Pick price column (prefer Adj Close)
+        if 'Adj Close' in d.columns:
+            sub = d['Adj Close']
+        elif 'Close' in d.columns:
+            sub = d['Close']
+        else:
+            # Squeeze any weird shape
+            try:
+                sub = d.squeeze()
+                if isinstance(sub, pd.DataFrame):
+                    sub = sub.iloc[:, 0]
+            except Exception:
+                continue
 
-        sub = d[col].copy()
-        # Make Yahoo index tz-naive, normalized to dates
-        sub.index = pd.to_datetime(sub.index).tz_localize(None).normalize()
+        if not isinstance(sub, pd.Series):
+            try:
+                sub = pd.Series(sub)
+            except Exception:
+                continue
 
-        # Align to trading-day index; drop missing for coverage check
+        # Normalize index to tz-naive dates & deduplicate
+        idx = pd.to_datetime(sub.index).tz_localize(None).normalize()
+        sub.index = idx
+        sub = sub[~sub.index.duplicated(keep='last')]
+
+        # Align to common trading-day index
         aligned = sub.reindex(td_index)
-        present = aligned.dropna()
 
-        if len(present) / len(td_index) >= min_data_fraction:
-            # Keep only the aligned series with the common index (NaNs kept to preserve index)
-            out[t] = aligned
-        time.sleep(sleep_sec)
+        # Require coverage
+        if aligned.notna().sum() / len(td_index) >= min_data_fraction:
+            out[t] = aligned.astype('float64')
+
+        if sleep_sec:
+            time.sleep(sleep_sec)
 
     if not out:
         return pd.DataFrame()
 
-    # Build DataFrame with shared trading-day index
-    df = pd.DataFrame(out, index=td_index)
-    return df
+    return pd.DataFrame(out, index=td_index)
 
 def calculate_sum_daily_return(prices):
+    """Sum of daily % changes (matches Excel 'sum of 1-day returns' style)."""
     if prices.empty or prices.shape[0] < 2:
         return pd.Series(dtype=float)
     return (prices.pct_change().sum() * 100).round(4)
@@ -103,20 +115,12 @@ def sector_performance(merged):
 
 def industry_group_performance(merged):
     return merged.groupby('Industry Group')['Sum Daily Return %'].mean().sort_values(ascending=False).round(4)
-# ----------------------------------------------------------------
 
-# -------------------------- UI --------------------------
-st.write("Default view is **Year-To-Date (YTD)**. You can also select a **custom range** or a **single day**.")
-
+# -------------------- UI CONTROLS --------------------
 today = date.today()
 ytd_start = date(today.year, 1, 1)
 
-mode = st.radio(
-    "Mode",
-    ["Year-to-date", "Custom range", "Single day"],
-    index=0,
-    horizontal=True
-)
+mode = st.radio("Mode", ["Year-to-date", "Custom range", "Single day"], index=0, horizontal=True)
 
 if mode == "Year-to-date":
     start_date = ytd_start
@@ -126,32 +130,35 @@ elif mode == "Custom range":
     with c1:
         start_date = st.date_input("Start date", value=ytd_start)
     with c2:
-        end_date = st.date_input("End date", value=today)
+        end_date = st.date_input("End date", value= today)
     if start_date > end_date:
         st.error("Start date must be on or before end date.")
         st.stop()
-else:  # Single day
+else:
+    # Single day: fetch a short window ending that day so pct_change has a prior day
     single_day = st.date_input("Date", value=today)
-    start_date = single_day
+    start_date = single_day - timedelta(days=7)
     end_date = single_day
 
 top_n = st.slider("Top/Bottom N", 5, 25, 10)
 
+st.divider()
+
+# -------------------- RUN --------------------
 with st.status("Fetching constituents & prices…", expanded=False):
     meta = get_sp500_metadata()
     tickers = meta["Ticker"].tolist()
-    prices = get_price_data_with_trading_days(tickers, str(start_date), str(end_date), min_data_fraction=0.90)
+    prices = get_price_data_with_trading_days(tickers, str(start_date), str(end_date), min_data_fraction=0.90, sleep_sec=0.0)
 
-# Diagnostics
 with st.expander("🔎 Diagnostics"):
-    st.write("Window:", str(start_date), "→", str(end_date), "(end+1 sent to Yahoo)")
+    st.write("Window:", str(start_date), "→", str(end_date), "(Yahoo sends end+1)")
     st.write("Prices shape:", prices.shape)
 
 if prices.empty:
-    st.error("No price data returned. Try a different date range, then use the ‘Rerun’ button in the top-right.")
+    st.error("No price data returned (date window too narrow, market holidays, or Yahoo hiccup). Try a different range.")
     st.stop()
 
-# Keep only tickers with data
+# Keep only tickers that have data
 meta = meta[meta['Ticker'].isin(prices.columns)]
 
 rets = calculate_sum_daily_return(prices)
@@ -168,12 +175,12 @@ grp = industry_group_performance(merged)
 c1, c2 = st.columns(2)
 with c1:
     st.subheader(f"🏆 Top {top_n} Gainers")
-    st.dataframe(top[['Ticker','Security','Sum Daily Return %']], use_container_width=True, hide_index=True)
+    st.dataframe(top[['Ticker','Security','Sum Daily Return %']].reset_index(drop=True), use_container_width=True)
 with c2:
     st.subheader(f"📉 Top {top_n} Losers")
-    st.dataframe(bottom[['Ticker','Security','Sum Daily Return %']], use_container_width=True, hide_index=True)
+    st.dataframe(bottom[['Ticker','Security','Sum Daily Return %']].reset_index(drop=True), use_container_width=True)
 
-st.subheader("📊 Sector Performance (Avg of ticker sum daily %)")
+st.subheader("📊 Sector Performance (Average of ticker sum of daily %)")
 st.dataframe(sec.to_frame('Sum Daily Return %'), use_container_width=True)
 
 c3, c4 = st.columns(2)
@@ -184,4 +191,4 @@ with c4:
     st.subheader("🏭 Industry Groups — Bottom 10")
     st.dataframe(grp.tail(10).to_frame('Sum Daily Return %'), use_container_width=True)
 
-st.caption("Notes: Yahoo end date is exclusive (we query end+1). S&P 500 list from Wikipedia; prices from Yahoo Finance (auto-adjusted).")
+st.caption("If a few tickers are missing, it’s due to incomplete Yahoo coverage in the chosen window. The analysis still runs on available symbols.")
